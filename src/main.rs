@@ -1,7 +1,7 @@
 #![warn(clippy::pedantic)]
 
 use std::{
-    fs::{self, DirEntry, FileType}, io, path::{Path, PathBuf}, process::ExitCode
+    fs::{self, DirEntry, FileType, ReadDir}, io, path::{Path, PathBuf}, process::ExitCode
 };
 
 use clap::Parser;
@@ -11,7 +11,7 @@ use dialoguer::{Confirm, Error, Input};
 #[command(author, version, about, long_about = None)]
 #[command(arg_required_else_help=true)]
 struct Cli {
-    /// Attempts to create a link for each file directly under base
+    /// Attempts to create a link for each file under base
     #[arg(value_parser = exists)]
     base: PathBuf,
 
@@ -22,6 +22,10 @@ struct Cli {
     #[arg(short, long)]
     /// Use symbolic links instead of hard links. Will usually fail on Windows since creating symlinks is a privileged action.
     symbolic: bool,
+
+    #[arg(short, long)]
+    /// Recurse into directories while creating symlinks
+    recurse: bool
 }
 
 fn exists(path: &str) -> Result<PathBuf, String> {
@@ -46,7 +50,7 @@ fn is_dir(path: &str) -> Result<PathBuf, String> {
 }
 
 impl Cli {
-    fn link_function<P: AsRef<Path>, Q: AsRef<Path>>(&self) -> fn(P, Q) -> io::Result<()> {
+    const fn link_function<P: AsRef<Path>, Q: AsRef<Path>>(&self) -> fn(P, Q) -> io::Result<()> {
         #[cfg(target_family = "unix")]
         if self.symbolic {
             return std::os::unix::fs::symlink
@@ -60,10 +64,15 @@ impl Cli {
     }
 }
 
-#[derive(PartialEq)]
 enum ShouldExit {
     No,
     Yes,
+}
+
+impl ShouldExit {
+    const fn should_exit(&self) -> bool {
+        matches!(self, Self::Yes)
+    }
 }
 
 /// Prompts the user to create a link and creates one if they agree.
@@ -76,11 +85,13 @@ enum ShouldExit {
 /// When link doesn't contain a filename.
 /// 
 fn link_file(original: &Path, link: &Path, cli: &Cli) -> io::Result<ShouldExit> {
-    assert!(link.file_name().is_some(), "`link` didn't contain a file name. `link`: {}", link.display());
-    let link_file_name = link.file_name().unwrap();
+    let maybe_link_name = link.file_name();
+    assert!(maybe_link_name.is_some(), "`link` didn't contain a file name. `link`: {}", link.display());
+    let link_file_name = maybe_link_name.unwrap();
 
     let create_link = Confirm::new()
         .with_prompt(format!("Create link from {} to {}?", link.display(), original.display()))
+        .default(true)
         .interact_opt()
         .map_err(|Error::IO(err)| err)?;
 
@@ -106,9 +117,122 @@ fn link_file(original: &Path, link: &Path, cli: &Cli) -> io::Result<ShouldExit> 
     Ok(ShouldExit::No)
 }
 
+enum CreateDirContinuation {
+    Exit,
+    Continue,
+    MaybeRecurse(PathBuf),
+}
+
+fn create_dir(location: &Path, name: &Path) -> io::Result<CreateDirContinuation> {
+    let create = Confirm::new()
+        .with_prompt(format!("Recreate the {} directory in {}", name.display(), location.display()))
+        .default(true)
+        .interact_opt()
+        .map_err(|Error::IO(err)| err)?;
+
+    let Some(create) = create else {
+        return Ok(CreateDirContinuation::Exit)
+    };
+
+    if !create {
+        return Ok(CreateDirContinuation::Continue);
+    }
+
+    let dir_name: String = Input::new()
+        .with_prompt("Dir name")
+        .with_initial_text(name.to_string_lossy())
+        .interact_text()
+        .map_err(|Error::IO(err)| err)?;
+
+    let new_dir_path = location.join(dir_name);
+
+    fs::create_dir(&new_dir_path)?;
+
+    Ok(CreateDirContinuation::MaybeRecurse(new_dir_path))
+}
+
 /// Gets the file type of a directory entry. Follows symbolic links and will therefore never return a link file type.
 fn get_definitive_file_type(entry: &DirEntry) -> io::Result<FileType> {
     Ok(fs::metadata(entry.path())?.file_type())
+}
+
+fn recurse_into_dir(directory: ReadDir, target: &Path, cli: &Cli) -> ShouldExit {
+    for maybe_dir in directory {
+        let entry = match maybe_dir {
+            Ok(dir) => dir,
+            Err(err) => {
+                eprintln!("Failed to open read dir: {err}");
+                continue;
+            },
+        };
+
+        let file_type = match get_definitive_file_type(&entry) {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                eprintln!("Failed to get entry file type: {err}");
+                continue;
+            },
+        };
+
+        if file_type.is_file() {
+            match link_file(&entry.path(), &target.join(entry.file_name()), cli) {
+                Ok(ShouldExit::No) => continue,
+                Ok(ShouldExit::Yes) => return ShouldExit::Yes,
+                Err(err) => {
+                    eprintln!("Encountered error while trying to link file: {err}");
+                    continue;
+                },
+            }
+        }
+        
+        match create_dir(target, Path::new(&entry.file_name())) {
+            Ok(CreateDirContinuation::Exit) => return ShouldExit::Yes,
+            Ok(CreateDirContinuation::Continue) => continue,
+            Ok(CreateDirContinuation::MaybeRecurse(new_dir_path)) => {
+                if !cli.recurse {
+                    continue;
+                }
+
+                let recurse = Confirm::new()
+                    .with_prompt("Should we recurse into the recreated folder?")
+                    .default(true)
+                    .interact_opt()
+                    .map_err(|Error::IO(err)| err);
+
+                if let Err(err) = recurse {
+                    eprintln!("Error in prompt: {err}");
+                    continue;
+                }
+
+                let recurse = recurse.unwrap();
+                if recurse.is_none() {
+                    return ShouldExit::Yes;
+                }
+
+                if !recurse.unwrap() {
+                    continue;
+                }
+
+                let recurse_dirs = match entry.path().read_dir() {
+                    Ok(recurse_dirs) => recurse_dirs,
+                    Err(err) => {
+                        eprintln!("Failed to recurse into directory: {err}");
+                        continue;
+                    },
+                };
+
+                if recurse_into_dir(recurse_dirs, &new_dir_path, cli).should_exit() {
+                    return ShouldExit::Yes;
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to create file: {err}");
+                continue;
+            },
+        }
+    }
+
+    ShouldExit::No
 }
 
 fn main() -> ExitCode {
@@ -133,36 +257,7 @@ fn main() -> ExitCode {
         },
     };
 
-    for maybe_dir in dirs {
-        let dir = match maybe_dir {
-            Ok(dir) => dir,
-            Err(err) => {
-                eprintln!("Failed to open read dir: {err}");
-                continue;
-            },
-        };
-
-        let file_type = match get_definitive_file_type(&dir) {
-            Ok(file_type) => file_type,
-            Err(err) => {
-                eprintln!("Failed to get entry file type: {err}");
-                continue;
-            },
-        };
-
-        if file_type.is_dir() {
-            continue;
-        }
-
-        match link_file(&dir.path(), &cli.target.join(dir.file_name()), &cli) {
-            Ok(ShouldExit::No) => {},
-            Ok(ShouldExit::Yes) => break,
-            Err(err) => {
-                eprintln!("Encountered error while trying to link file: {err}");
-                continue;
-            },
-        }
-    }
+    recurse_into_dir(dirs, &cli.target, &cli);
 
     ExitCode::SUCCESS
 }
