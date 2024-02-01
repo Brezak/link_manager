@@ -1,7 +1,10 @@
 #![warn(clippy::pedantic)]
 
 use std::{
-    fs::{self, DirEntry, FileType, ReadDir}, io, path::{Path, PathBuf}, process::ExitCode
+    fs::{self, DirEntry, FileType, ReadDir},
+    io,
+    path::{Path, PathBuf},
+    process::ExitCode,
 };
 
 use clap::Parser;
@@ -9,7 +12,7 @@ use dialoguer::{Confirm, Error, Input};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-#[command(arg_required_else_help=true)]
+#[command(arg_required_else_help = true)]
 struct Cli {
     /// Attempts to create a link for each file under base
     #[arg(value_parser = exists)]
@@ -25,7 +28,7 @@ struct Cli {
 
     #[arg(short, long)]
     /// Recurse into directories while creating symlinks
-    recurse: bool
+    recurse: bool,
 }
 
 fn exists(path: &str) -> Result<PathBuf, String> {
@@ -40,8 +43,10 @@ fn exists(path: &str) -> Result<PathBuf, String> {
 
 fn is_dir(path: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(path);
-    
-    let metadata = path.metadata().map_err(|err| format!("Can't open <TARGET> directory: {err}"))?;
+
+    let metadata = path
+        .metadata()
+        .map_err(|err| format!("Can't open <TARGET> directory: {err}"))?;
     if metadata.is_dir() {
         Ok(path)
     } else {
@@ -53,7 +58,7 @@ impl Cli {
     const fn link_function<P: AsRef<Path>, Q: AsRef<Path>>(&self) -> fn(P, Q) -> io::Result<()> {
         #[cfg(target_family = "unix")]
         if self.symbolic {
-            return std::os::unix::fs::symlink
+            return std::os::unix::fs::symlink;
         }
         #[cfg(target_family = "windows")]
         if self.symbolic {
@@ -76,21 +81,29 @@ impl ShouldExit {
 }
 
 /// Prompts the user to create a link and creates one if they agree.
-/// 
+///
 /// `original` File to create a link to.
 /// `link` Link that will point to `original`
-/// 
+///
 /// # Panics
-/// 
+///
 /// When link doesn't contain a filename.
-/// 
+///
 fn link_file(original: &Path, link: &Path, cli: &Cli) -> io::Result<ShouldExit> {
     let maybe_link_name = link.file_name();
-    assert!(maybe_link_name.is_some(), "`link` didn't contain a file name. `link`: {}", link.display());
+    assert!(
+        maybe_link_name.is_some(),
+        "`link` didn't contain a file name. `link`: {}",
+        link.display()
+    );
     let link_file_name = maybe_link_name.unwrap();
 
     let create_link = Confirm::new()
-        .with_prompt(format!("Create link from {} to {}?", link.display(), original.display()))
+        .with_prompt(format!(
+            "Create link from `{}` to `{}`?",
+            link.display(),
+            original.display()
+        ))
         .default(true)
         .interact_opt()
         .map_err(|Error::IO(err)| err)?;
@@ -125,13 +138,17 @@ enum CreateDirContinuation {
 
 fn create_dir(location: &Path, name: &Path) -> io::Result<CreateDirContinuation> {
     let create = Confirm::new()
-        .with_prompt(format!("Recreate the {} directory in {}", name.display(), location.display()))
+        .with_prompt(format!(
+            "Recreate the `{}` directory in {}?",
+            name.display(),
+            location.display()
+        ))
         .default(true)
         .interact_opt()
         .map_err(|Error::IO(err)| err)?;
 
     let Some(create) = create else {
-        return Ok(CreateDirContinuation::Exit)
+        return Ok(CreateDirContinuation::Exit);
     };
 
     if !create {
@@ -163,7 +180,7 @@ fn recurse_into_dir(directory: ReadDir, target: &Path, cli: &Cli) -> ShouldExit 
             Err(err) => {
                 eprintln!("Failed to open read dir: {err}");
                 continue;
-            },
+            }
         };
 
         let file_type = match get_definitive_file_type(&entry) {
@@ -171,7 +188,7 @@ fn recurse_into_dir(directory: ReadDir, target: &Path, cli: &Cli) -> ShouldExit 
             Err(err) => {
                 eprintln!("Failed to get entry file type: {err}");
                 continue;
-            },
+            }
         };
 
         if file_type.is_file() {
@@ -181,10 +198,10 @@ fn recurse_into_dir(directory: ReadDir, target: &Path, cli: &Cli) -> ShouldExit 
                 Err(err) => {
                     eprintln!("Encountered error while trying to link file: {err}");
                     continue;
-                },
+                }
             }
         }
-        
+
         match create_dir(target, Path::new(&entry.file_name())) {
             Ok(CreateDirContinuation::Exit) => return ShouldExit::Yes,
             Ok(CreateDirContinuation::Continue) => continue,
@@ -218,7 +235,7 @@ fn recurse_into_dir(directory: ReadDir, target: &Path, cli: &Cli) -> ShouldExit 
                     Err(err) => {
                         eprintln!("Failed to recurse into directory: {err}");
                         continue;
-                    },
+                    }
                 };
 
                 if recurse_into_dir(recurse_dirs, &new_dir_path, cli).should_exit() {
@@ -228,7 +245,7 @@ fn recurse_into_dir(directory: ReadDir, target: &Path, cli: &Cli) -> ShouldExit 
             Err(err) => {
                 eprintln!("Failed to create file: {err}");
                 continue;
-            },
+            }
         }
     }
 
@@ -239,7 +256,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     if cli.base.is_file() {
-        let base_file_name = cli.base.file_name().expect("<BASE> was provided a file that doesn't have a valid filename by Rust rules");
+        let base_file_name = cli
+            .base
+            .file_name()
+            .expect("<BASE> was provided a file that doesn't have a valid filename by Rust rules");
         let link = cli.target.join(base_file_name); // We have validated target to be a directory.
         if let Err(err) = link_file(&cli.base, &link, &cli) {
             eprintln!("Encountered and error while handling file: {err}");
@@ -254,7 +274,7 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("Failed to read <BASE> dir: {err}");
             return ExitCode::FAILURE;
-        },
+        }
     };
 
     recurse_into_dir(dirs, &cli.target, &cli);
